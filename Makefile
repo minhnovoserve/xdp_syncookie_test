@@ -8,3 +8,4 @@ CFLAGS_XDP+= $(IFLAGS)
 all:
 	$(CC) $(CFLAGS_XDP) xdp_synproxy_kern.c -o xdp_synproxy_kern.bpf.o 
 	$(CC) $(CFLAGS) xdp_synproxy.c -o xdp_synproxy -lxdp
+	$(CC) $(CFLAGS_XDP) xdp_synproxy_statistic_kern.c -o xdp_synproxy_statistic_kern.bpf.o 
