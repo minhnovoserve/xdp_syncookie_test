@@ -1,17 +1,24 @@
-// SPDX-License-Identifier: LGPL-2.1 OR BSD-2-Clause
-/* Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved. */
-
-//go:build ignore
-
 #include "vmlinux.h"
-
-// SPDX-License-Identifier: LGPL-2.1 OR BSD-2-Clause
-/* Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved. */
-
-
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 #include <asm/errno.h>
+#include "common_xdp.h"
+
+#define s6_addr32 in6_u.u6_addr32
+#define ipv6_addr_equal(a, b)	((a).s6_addr32[0] == (b).s6_addr32[0] &&	\
+				 (a).s6_addr32[1] == (b).s6_addr32[1] &&	\
+				 (a).s6_addr32[2] == (b).s6_addr32[2] &&	\
+				 (a).s6_addr32[3] == (b).s6_addr32[3])
+
+/* LLVM maps __sync_fetch_and_add() as a built-in function to the BPF atomic add
+ * instruction (that is BPF_STX | BPF_XADD | BPF_W for word sizes)
+ */
+#ifndef lock_xadd
+#define lock_xadd(ptr, val)	((void) __sync_fetch_and_add(ptr, val))
+#endif
+
+#define IP_FRAGMENTED 65343
+#define IPPROTO_ICMPV6 58
 
 #define TC_ACT_OK 0
 #define TC_ACT_SHOT 2
@@ -53,6 +60,9 @@
 #define IPV4_MAXLEN 60
 #define TCP_MAXLEN 60
 
+#define ICMPV6_ECHO_REQUEST		128
+#define ICMPV6_ECHO_REPLY		129
+
 #define DEFAULT_MSS4 1460
 #define DEFAULT_MSS6 1440
 #define DEFAULT_WSCALE 7
@@ -74,6 +84,13 @@
     }
                          
 #define get_unaligned(ptr) __get_unaligned_t(typeof(*(ptr)), (ptr))
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, struct pack_stat);
+	__uint(max_entries, xdp_unknown + 1);
+} xdp_stats_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -326,7 +343,7 @@ static __always_inline void values_inc_synacks(void)
 
 	value = bpf_map_lookup_elem(&values, &key);
 	if (value)
-		__sync_fetch_and_add(value, 1);
+		lock_xadd(value, 1);
 }
 
 static __always_inline bool check_port_allowed(__u16 port)
@@ -359,8 +376,222 @@ struct header_pointers {
 	struct iphdr *ipv4;
 	struct ipv6hdr *ipv6;
 	struct tcphdr *tcp;
+	struct udphdr *udp;
+	
 	__u16 tcp_len;
 };
+
+static __always_inline 
+__u8 check_block_subnet(__u32 addr){
+	__u8 res = ((addr & 0xFF000000) == 0xA000000); // 10.0.0.0/8
+	res |= ((addr & 0xFF000000) == 0x7F000000); // 127.0.0.0/8
+	res |= ((addr & 0xFFFF0000) == 0xA9FE0000); // 169.254.0.0/16
+	res |= ((addr & 0xFFF00000) == 0xAC100000); // 172.16.0.0/12
+	res |= ((addr & 0xFFFF0000) == 0xC0A80000); // 192.168.0.0/16
+	res |= ((addr & 0xE0000000) == 0xE0000000); // 224.0.0.0/3
+	return res;
+
+}
+static __always_inline 
+void update_packet_info(__u8 action, __u32 type, __u8 reason){
+	
+	struct pack_stat *packet = bpf_map_lookup_elem(&xdp_stats_map, &type);
+	if(packet != NULL){
+		packet->action = action;
+		packet->xdp_type = type;
+		packet->reason = reason;
+		lock_xadd(&(packet->num), 1);	
+		bpf_printk("Update info action: %d, type: %d, reason: %d, num: %d", action, type, reason, packet->num);					
+	}
+	
+}
+static __always_inline
+int check_common_ip(struct header_pointers* hdr){
+	__u32 pack_type = xdp_ip;
+	if(hdr->ipv4){
+		if(hdr->ipv4->saddr == hdr->ipv4->daddr){
+			bpf_printk("Drop due to saddr == daddr");
+			update_packet_info( XDP_DROP, pack_type, invalid_packet_saddr_eq_daddr);
+			return XDP_DROP;
+		}
+		if(check_block_subnet(bpf_htonl(hdr->ipv4->saddr))){
+			bpf_printk("Drop due to block subnet");
+			update_packet_info( XDP_DROP, pack_type, blocked_subnet);
+			return XDP_DROP;
+		}
+	}
+	if(hdr->ipv6){
+		if(ipv6_addr_equal(hdr->ipv6->saddr, hdr->ipv6->daddr)){
+			bpf_printk("Drop due to saddr == daddr");
+			update_packet_info( XDP_DROP, pack_type, invalid_packet_saddr_eq_daddr);
+			return XDP_DROP;
+		}
+	}
+	return XDP_PASS;
+}
+static __always_inline
+int check_tcp(struct header_pointers *hdr){
+	__u32 pack_type = xdp_unknown;
+	if(bpf_ntohs(hdr->eth->h_proto) == ETH_P_IP){
+		pack_type = xdp_tcp_unknown;
+	}
+	if(bpf_ntohs(hdr->eth->h_proto) == ETH_P_IPV6){
+		pack_type = xdp_tcp_unknown_ipv6;
+	}
+	if(pack_type == xdp_tcp_unknown){
+		switch(bpf_htons(hdr->tcp->dest)){
+			case 53:
+				pack_type = xdp_tcp_dns;
+				break;
+			case 80:
+				pack_type = xdp_tcp_http;
+				break;
+			case 443:
+				pack_type = xdp_tcp_https;
+				break;
+			default:
+				pack_type = xdp_tcp_unknown;							
+		}
+	}
+	if(pack_type == xdp_tcp_unknown_ipv6){
+		switch(bpf_htons(hdr->tcp->dest)){
+			case 53:
+				pack_type = xdp_tcp_dns_ipv6;
+				break;
+			case 80:
+				pack_type = xdp_tcp_http_ipv6;
+				break;
+			case 443:
+				pack_type = xdp_tcp_https_ipv6;
+				break;
+			default:
+				pack_type = xdp_tcp_unknown_ipv6;							
+		}
+	}
+	if(bpf_htons(hdr->tcp->source) == 0 || bpf_htons(hdr->tcp->dest) == 0) {// invalid crap
+		bpf_printk("TCP Drop due to invalid port");
+		update_packet_info( XDP_DROP, pack_type, invalid_port);
+		return XDP_DROP;
+	} 
+	// Do not allow 'server-server' connections
+    if(bpf_htons(hdr->tcp->source) < 1024 && bpf_htons(hdr->tcp->dest) < 1024) {
+		bpf_printk("TCP Drop due to server-server connection");
+		update_packet_info( XDP_DROP, pack_type, server_server_connection);
+		return XDP_DROP;
+	} 
+	// alt HTTP
+    if(bpf_htons(hdr->tcp->source) < 1024 && bpf_htons(hdr->tcp->dest) == 8080) {
+		bpf_printk("TCP Drop due to alt http");
+		update_packet_info( XDP_DROP, pack_type, alt_http);
+		return XDP_DROP;
+	} 
+	// IPTV shit
+    if(bpf_htons(hdr->tcp->source) < 1024 && bpf_htons(hdr->tcp->dest) == 25461) {
+		bpf_printk("TCP Drop due to iptv");
+		update_packet_info( XDP_DROP, pack_type, block_iptv);
+		return XDP_DROP;
+	} 
+	update_packet_info(XDP_PASS, pack_type, no_rule);
+	return XDP_PASS;
+}
+static __always_inline
+int check_udp(void* data, void* data_end,struct header_pointers *hdr){
+	__u32 pack_type = xdp_unknown;
+	if ((hdr->udp) + 1 > data_end){
+		return XDP_DROP;
+	}
+	if(bpf_ntohs(hdr->eth->h_proto) == ETH_P_IP){
+		pack_type = xdp_udp_unknown;
+	}
+	if(bpf_ntohs(hdr->eth->h_proto) == ETH_P_IPV6){
+		pack_type = xdp_udp_unknown_ipv6;
+	}
+	if(pack_type == xdp_udp_unknown){
+		switch(bpf_htons(hdr->udp->dest)){
+			case 53:
+				pack_type = xdp_udp_dns;
+				break;
+			case 80:
+				pack_type = xdp_udp_quic;
+				break;
+			case 123:
+				pack_type = xdp_udp_ntp;
+				break;
+			case 443:
+				pack_type = xdp_udp_quic;
+				break;
+			default:
+				pack_type = xdp_udp_unknown;
+		}
+	}
+	if(pack_type == xdp_udp_unknown_ipv6){
+		switch(bpf_htons(hdr->udp->dest)){
+		case 53:
+			pack_type = xdp_udp_dns_ipv6;
+			break;
+		case 80:
+			pack_type = xdp_udp_quic_ipv6;
+				break;
+		case 123:
+			pack_type = xdp_udp_ntp_ipv6;
+			break;
+		case 443:
+			pack_type = xdp_udp_quic_ipv6;
+			break;
+		default:
+			pack_type = xdp_udp_unknown_ipv6;
+		}
+	}
+	
+	// invalid crap
+    if(bpf_htons(hdr->udp->source) == 0 || bpf_htons(hdr->udp->dest) == 0) {
+		bpf_printk("UDP Drop due to invalid port");
+		update_packet_info( XDP_DROP, pack_type, invalid_port);
+		return XDP_DROP;
+	} 
+	// Do not allow 'server-server' connections
+    if(bpf_htons(hdr->udp->source) < 1024 && bpf_htons(hdr->udp->dest) < 1024) {
+		bpf_printk("UDP Drop due to server-server connection");
+		update_packet_info( XDP_DROP, pack_type, server_server_connection);
+		return XDP_DROP;
+	}
+	update_packet_info(XDP_PASS, pack_type, no_rule);
+	return XDP_PASS;
+					
+}
+static __always_inline
+int check_icmp(void* data, void* data_end,struct header_pointers *hdr){
+	__u32 pack_type = xdp_icmp;
+	if(hdr->ipv4){
+		struct icmphdr *icmp = (void*)(hdr->ipv4) + sizeof(*(hdr->ipv4));
+		if((void*)icmp + sizeof(*icmp) <= data_end) { // ICMP filtering rules
+			// Only allow echo request (8) and echo reply (0) to pass
+			pack_type = xdp_icmp;
+		    if(bpf_htons(icmp->type) != bpf_htons(0) && bpf_htons(icmp->type) != bpf_htons(8)) {
+				bpf_printk("Drop due to invalid icmp");
+				update_packet_info( XDP_DROP, pack_type, invalid_icmp);
+				return XDP_DROP;
+			} 
+		}
+	}
+	
+	if(hdr->ipv6){
+		struct icmp6hdr *icmp6 = (void*)(hdr->ipv6) + sizeof(*(hdr->ipv6));
+		pack_type = xdp_icmp_ipv6;
+		if((void*)icmp6 + sizeof(*icmp6) <= data_end) {
+            pack_type = xdp_icmp_ipv6;
+					
+			if (icmp6->icmp6_type != ICMPV6_ECHO_REQUEST && icmp6->icmp6_type != ICMPV6_ECHO_REPLY) {
+                // Drop ICMPv6 packets other than Echo Request (Type 128) and Echo Reply (Type 129)
+				update_packet_info( XDP_DROP, pack_type, invalid_icmp);
+                return XDP_DROP;
+           	}
+		}
+	}
+	 // Allow valid ICMP packets
+	update_packet_info( XDP_PASS, pack_type, no_rule);
+	return XDP_PASS;
+}
 
 static __always_inline int tcp_dissect(void *data, void *data_end,
 				       struct header_pointers *hdr)
@@ -371,7 +602,7 @@ static __always_inline int tcp_dissect(void *data, void *data_end,
 		return XDP_DROP;
 	}
 		
-
+	int res = XDP_PASS;
 	switch (bpf_ntohs(hdr->eth->h_proto)) {
 	case ETH_P_IP:
 		hdr->ipv6 = NULL;
@@ -395,10 +626,26 @@ static __always_inline int tcp_dissect(void *data, void *data_end,
 			return XDP_DROP;
 		}
 			
-
+		res = check_common_ip(hdr);
+		if(res!= XDP_PASS){
+			return res;
+		}
 		if (hdr->ipv4->protocol != IPPROTO_TCP){
-			DEBUG_PRINT("tcp_dissect XDP_PASS");
-			return XDP_PASS;
+			if(hdr->ipv4->protocol == IPPROTO_ICMP){
+				return check_icmp(data, data_end, hdr);
+			}
+			else if(hdr->ipv4->protocol == IPPROTO_UDP){
+				return check_udp(data, data_end, hdr);
+			}
+			else{
+				DEBUG_PRINT("tcp_dissect XDP_PASS");
+				return XDP_PASS;
+			}
+			
+		}
+		res = check_tcp(hdr);
+		if(res != XDP_PASS){
+			return res;
 		}
 			
 
@@ -418,7 +665,19 @@ static __always_inline int tcp_dissect(void *data, void *data_end,
 			return XDP_DROP;
 
 		}
-			
+		res = check_common_ip(hdr);
+		if(res != XDP_PASS){
+			return res;
+		}
+		if(hdr->ipv6->nexthdr == IPPROTO_ICMPV6)
+		{
+			return check_icmp(data, data_end, hdr);
+		}
+		if(hdr->ipv6->nexthdr == IPPROTO_UDP){
+			return check_udp(data, data_end, hdr);
+		}
+		
+		
 		/* XXX: Extension headers are not supported and could circumvent
 		 * XDP SYN flood protection.
 		 */
@@ -429,6 +688,10 @@ static __always_inline int tcp_dissect(void *data, void *data_end,
 			
 
 		hdr->tcp = (void *)hdr->ipv6 + sizeof(*hdr->ipv6);
+		res = check_tcp(hdr);
+		if(res != XDP_PASS){
+			return res;
+		}
 		break;
 	default:
 		/* XXX: VLANs will circumvent XDP SYN flood protection. */
@@ -497,11 +760,7 @@ static __always_inline int tcp_lookup(void *ctx, struct header_pointers *hdr, bo
 	if (ct) {
 		unsigned long status = ct->status;
 
-		bpf_ct_release(ct);
-		// if (status & IPS_CONFIRMED_BIT){
-		// 	DEBUG_PRINT("tcp_lookup XDP_PASS");
-		// 	return XDP_PASS;
-		// }
+		bpf_ct_release(ct);          
 		if (status & IPS_CONFIRMED){
 			DEBUG_PRINT("tcp_lookup XDP_PASS");
 			return XDP_PASS;
@@ -941,9 +1200,9 @@ static __always_inline int syncookie_part2(void *ctx, void *data, void *data_end
 			       syncookie_handle_ack(hdr);
 }
 
+
 SEC("xdp")
-int syncookie_xdp(struct xdp_md *ctx)
-{
+int xdp_packet_filter(struct xdp_md *ctx) {
 	void *data_end = (void *)(long)ctx->data_end;
 	void *data = (void *)(long)ctx->data;
 	struct header_pointers hdr;
@@ -958,31 +1217,4 @@ int syncookie_xdp(struct xdp_md *ctx)
 
 	return syncookie_part2(ctx, data, data_end, &hdr, true);
 }
-
-SEC("tc")
-int syncookie_tc(struct __sk_buff *skb)
-{
-	void *data_end = (void *)(long)skb->data_end;
-	void *data = (void *)(long)skb->data;
-	struct header_pointers hdr;
-	int ret;
-
-	ret = syncookie_part1(skb, data, data_end, &hdr, false);
-	if (ret != XDP_TX)
-		return ret == XDP_PASS ? TC_ACT_OK : TC_ACT_SHOT;
-
-	data_end = (void *)(long)skb->data_end;
-	data = (void *)(long)skb->data;
-
-	ret = syncookie_part2(skb, data, data_end, &hdr, false);
-	switch (ret) {
-	case XDP_PASS:
-		return TC_ACT_OK;
-	case XDP_TX:
-		return bpf_redirect(skb->ifindex, 0);
-	default:
-		return TC_ACT_SHOT;
-	}
-}
-
-char _license[] SEC("license") = "GPL";
+char LICENSE[] SEC("license") = "GPL";
